@@ -1,6 +1,7 @@
 /** Built-in project flow command; resources start only after a session begins. */
 import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/types.ts";
 import { openFlowBrowser, startFlowServer } from "../../flow/server.ts";
+import { showProjectFlow } from "../../flow/tui.ts";
 
 type FlowServer = Awaited<ReturnType<typeof startFlowServer>>;
 
@@ -8,9 +9,12 @@ export default function dataFlowExtension(pi: ExtensionAPI): void {
 	let running: Promise<FlowServer> | undefined;
 	let runningRoot: string | undefined;
 	let lifecycle = 0;
+	let nativeScreen: AbortController | undefined;
 
 	const close = async (): Promise<void> => {
 		lifecycle++;
+		nativeScreen?.abort();
+		nativeScreen = undefined;
 		const pending = running;
 		running = undefined;
 		runningRoot = undefined;
@@ -19,7 +23,7 @@ export default function dataFlowExtension(pi: ExtensionAPI): void {
 		await server?.close();
 	};
 
-	const open = async (ctx: ExtensionContext): Promise<void> => {
+	const openWeb = async (ctx: ExtensionContext): Promise<void> => {
 		if (ctx.mode !== "tui") {
 			ctx.ui.notify("Use /flow in interactive mode, or run pi flow from a terminal.", "warning");
 			return;
@@ -46,27 +50,48 @@ export default function dataFlowExtension(pi: ExtensionAPI): void {
 		}
 	};
 
+	const openNative = async (ctx: ExtensionContext): Promise<void> => {
+		if (ctx.mode !== "tui") {
+			ctx.ui.notify("/flow requires an interactive Pi terminal.", "warning");
+			return;
+		}
+		nativeScreen?.abort();
+		const controller = new AbortController();
+		nativeScreen = controller;
+		try {
+			await showProjectFlow(ctx, controller.signal);
+		} catch (error) {
+			if (!controller.signal.aborted) {
+				ctx.ui.notify(`Project flow: ${error instanceof Error ? error.message : String(error)}`, "error");
+			}
+		} finally {
+			if (nativeScreen === controller) nativeScreen = undefined;
+		}
+	};
+
 	pi.registerFlag("flow", {
-		description: "Open this project's data-flow screen when the interactive session starts",
+		description: "Open this project's data-flow screen inside the interactive Pi harness",
 		type: "boolean",
 		default: false,
 	});
 	pi.registerCommand("flow", {
-		description: "Open or refresh this project's data-flow screen (/flow close to stop)",
+		description: "Explore data flow inside Pi (/flow web for browser; /flow close to stop)",
 		handler: async (args, ctx) => {
 			if (args.trim() === "close") {
 				await close();
 				ctx.ui.setStatus("project-flow", undefined);
 				ctx.ui.notify("Project flow closed.", "info");
+			} else if (args.trim() === "web") {
+				await openWeb(ctx);
 			} else if (args.trim()) {
-				ctx.ui.notify("Usage: /flow or /flow close", "warning");
+				ctx.ui.notify("Usage: /flow, /flow web, or /flow close", "warning");
 			} else {
-				await open(ctx);
+				await openNative(ctx);
 			}
 		},
 	});
 	pi.on("session_start", async (_event, ctx) => {
-		if (ctx.mode === "tui" && pi.getFlag("flow") === true) await open(ctx);
+		if (ctx.mode === "tui" && pi.getFlag("flow") === true) await openNative(ctx);
 	});
 	pi.on("session_shutdown", async () => close());
 }

@@ -32,14 +32,16 @@ The service makes **no outbound network requests by default**. Setting `ORDER_WE
 In another terminal, from this directory:
 
 ```bash
-../../pi-test.sh flow
+../../pi-test.sh --flow
 ```
 
 Or, with this fork installed:
 
 ```bash
-pi flow
+pi --flow
 ```
+
+Or enter `/flow` inside a running Pi session. The diagram opens inside the actual harness terminal, with component and connection views, source evidence, and a rescan action. Escape returns to the coding agent. Use `pi flow` or `/flow web` if you want the optional browser companion instead.
 
 The analysis starts at this directory, so it reads the example's actual source files. It does not start the example service or execute any source.
 
@@ -47,4 +49,4 @@ Follow the components: `server` accepts HTTP requests; `http` reads JSON and rou
 
 The HTTP/API node appears because a `fetch()` call exists in `src/integrations/webhook.js`. That is a possible network relationship inferred from source, even while the webhook is disabled. It is not a claim that a request was sent. The incoming network boundary is similarly inferred from `createServer()` and `listen()`.
 
-The hosted Pi Flow demo uses a saved analysis of this code. Its search, component selection, evidence, diagram controls, and exports can be tested without running this service. Fresh scans of your own files are available through the local CLI.
+The hosted graphical companion can use a saved analysis of this code. A hosted web terminal runs the actual Pi harness, where `/flow` scans the example directory and displays this same native screen. Neither analysis mode starts the Orders service.

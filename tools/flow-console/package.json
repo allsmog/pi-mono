@@ -1,0 +1,18 @@
+{
+  "name": "pi-flow-console",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A private browser terminal for the forked Pi coding harness",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node server.mjs --port 4173",
+    "test:console": "node --test test.mjs"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/xterm": "6.0.0",
+    "ws": "8.21.0"
+  }
+}

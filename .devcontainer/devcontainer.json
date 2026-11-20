@@ -1,0 +1,26 @@
+{
+	"name": "Pi Flow (Node 24)",
+	"build": {
+		"dockerfile": "Dockerfile"
+	},
+	"remoteUser": "node",
+	"init": true,
+	"postCreateCommand": "npm ci --ignore-scripts && npm run hydrate:model-data && npm --prefix tools/flow-console ci --ignore-scripts",
+	"waitFor": "postCreateCommand",
+	"forwardPorts": [4317],
+	"portsAttributes": {
+		"4317": {
+			"label": "Pi Flow terminal",
+			"onAutoForward": "silent",
+			"protocol": "http",
+			"requireLocalPort": true
+		}
+	},
+	"customizations": {
+		"vscode": {
+			"settings": {
+				"terminal.integrated.defaultProfile.linux": "bash"
+			}
+		}
+	}
+}

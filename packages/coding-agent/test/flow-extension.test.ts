@@ -8,12 +8,14 @@ import type {
 } from "../src/core/extensions/types.ts";
 import dataFlowExtension from "../src/extensions/data-flow/index.ts";
 import { openFlowBrowser, startFlowServer } from "../src/flow/server.ts";
+import { showProjectFlow } from "../src/flow/tui.ts";
 import type { FlowGraph } from "../src/flow/types.ts";
 
 vi.mock("../src/flow/server.ts", () => ({
 	startFlowServer: vi.fn(),
 	openFlowBrowser: vi.fn(),
 }));
+vi.mock("../src/flow/tui.ts", () => ({ showProjectFlow: vi.fn() }));
 
 const graph: FlowGraph = {
 	version: 1,
@@ -71,6 +73,7 @@ describe("built-in project flow extension", () => {
 			rescan,
 		});
 		vi.mocked(openFlowBrowser).mockResolvedValue(true);
+		vi.mocked(showProjectFlow).mockResolvedValue(undefined);
 	});
 
 	test("registration and normal session startup perform no scan or browser launch", async () => {
@@ -79,12 +82,21 @@ describe("built-in project flow extension", () => {
 		await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
 		expect(startFlowServer).not.toHaveBeenCalled();
 		expect(openFlowBrowser).not.toHaveBeenCalled();
+		expect(showProjectFlow).not.toHaveBeenCalled();
+	});
+
+	test("/flow opens the native harness screen without starting a browser or HTTP server", async () => {
+		const { ctx, commands } = harness();
+		await commands.get("flow")?.handler("", ctx);
+		expect(showProjectFlow).toHaveBeenCalledWith(ctx, expect.any(AbortSignal));
+		expect(startFlowServer).not.toHaveBeenCalled();
+		expect(openFlowBrowser).not.toHaveBeenCalled();
 	});
 
 	test("the command reuses the running project server, rescans, and closes on session shutdown", async () => {
 		const { ctx, commands, handlers } = harness();
-		await commands.get("flow")?.handler("", ctx);
-		await commands.get("flow")?.handler("", ctx);
+		await commands.get("flow")?.handler("web", ctx);
+		await commands.get("flow")?.handler("web", ctx);
 		expect(startFlowServer).toHaveBeenCalledExactlyOnceWith("/fixture");
 		expect(rescan).toHaveBeenCalledOnce();
 		expect(openFlowBrowser).toHaveBeenCalledTimes(2);
@@ -96,18 +108,19 @@ describe("built-in project flow extension", () => {
 		const { ctx, handlers } = harness(true);
 		ctx.mode = "rpc";
 		await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
-		expect(startFlowServer).not.toHaveBeenCalled();
+		expect(showProjectFlow).not.toHaveBeenCalled();
 		ctx.mode = "tui";
 		await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
-		expect(startFlowServer).toHaveBeenCalledWith("/fixture");
+		expect(showProjectFlow).toHaveBeenCalledWith(ctx, expect.any(AbortSignal));
+		expect(startFlowServer).not.toHaveBeenCalled();
 		await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
 	});
 
 	test("switching the launch directory closes the old server before opening the new project", async () => {
 		const { ctx, commands } = harness();
-		await commands.get("flow")?.handler("", ctx);
+		await commands.get("flow")?.handler("web", ctx);
 		ctx.cwd = "/other-project";
-		await commands.get("flow")?.handler("", ctx);
+		await commands.get("flow")?.handler("web", ctx);
 		expect(close).toHaveBeenCalledOnce();
 		expect(startFlowServer).toHaveBeenLastCalledWith("/other-project");
 		await commands.get("flow")?.handler("close", ctx);
@@ -117,9 +130,9 @@ describe("built-in project flow extension", () => {
 	test("a failed startup can be retried and the error is visible", async () => {
 		const { ctx, commands } = harness();
 		vi.mocked(startFlowServer).mockRejectedValueOnce(new Error("Directory is unreadable"));
-		await commands.get("flow")?.handler("", ctx);
+		await commands.get("flow")?.handler("web", ctx);
 		expect(ctx.ui.notify).toHaveBeenCalledWith("Project flow: Directory is unreadable", "error");
-		await commands.get("flow")?.handler("", ctx);
+		await commands.get("flow")?.handler("web", ctx);
 		expect(openFlowBrowser).toHaveBeenCalledOnce();
 		await commands.get("flow")?.handler("close", ctx);
 	});
@@ -134,7 +147,7 @@ describe("built-in project flow extension", () => {
 					finishOpen = resolve;
 				}),
 			);
-			const opening = commands.get("flow")?.handler("", ctx);
+			const opening = commands.get("flow")?.handler("web", ctx);
 			await vi.waitFor(() => expect(openFlowBrowser).toHaveBeenCalledOnce());
 			if (stop === "session shutdown") {
 				await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
@@ -150,4 +163,19 @@ describe("built-in project flow extension", () => {
 			expect(vi.mocked(ctx.ui.notify).mock.calls).toEqual(notifications);
 		},
 	);
+
+	test("session shutdown aborts an open native screen", async () => {
+		const { ctx, commands, handlers } = harness();
+		vi.mocked(showProjectFlow).mockImplementationOnce(
+			(_ctx, signal) =>
+				new Promise<void>((resolve) => {
+					signal?.addEventListener("abort", () => resolve(), { once: true });
+				}),
+		);
+		const opening = commands.get("flow")?.handler("", ctx);
+		await vi.waitFor(() => expect(showProjectFlow).toHaveBeenCalledOnce());
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+		await opening;
+		expect(vi.mocked(showProjectFlow).mock.calls[0][1]?.aborted).toBe(true);
+	});
 });
