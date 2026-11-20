@@ -50,7 +50,10 @@ export default function dataFlowExtension(pi: ExtensionAPI): void {
 		}
 	};
 
-	const openNative = async (ctx: ExtensionContext): Promise<void> => {
+	const openNative = async (
+		ctx: ExtensionContext,
+		mode: "codeboarding" | "static" | "quick" = "codeboarding",
+	): Promise<void> => {
 		if (ctx.mode !== "tui") {
 			ctx.ui.notify("/flow requires an interactive Pi terminal.", "warning");
 			return;
@@ -59,7 +62,7 @@ export default function dataFlowExtension(pi: ExtensionAPI): void {
 		const controller = new AbortController();
 		nativeScreen = controller;
 		try {
-			await showProjectFlow(ctx, controller.signal);
+			await showProjectFlow(ctx, controller.signal, mode);
 		} catch (error) {
 			if (!controller.signal.aborted) {
 				ctx.ui.notify(`Project flow: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -75,7 +78,7 @@ export default function dataFlowExtension(pi: ExtensionAPI): void {
 		default: false,
 	});
 	pi.registerCommand("flow", {
-		description: "Explore data flow inside Pi (/flow web for browser; /flow close to stop)",
+		description: "Explore CodeBoarding diagrams (/flow static, /flow quick, /flow web, /flow close)",
 		handler: async (args, ctx) => {
 			if (args.trim() === "close") {
 				await close();
@@ -83,8 +86,10 @@ export default function dataFlowExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify("Project flow closed.", "info");
 			} else if (args.trim() === "web") {
 				await openWeb(ctx);
+			} else if (args.trim() === "static" || args.trim() === "quick") {
+				await openNative(ctx, args.trim() === "static" ? "static" : "quick");
 			} else if (args.trim()) {
-				ctx.ui.notify("Usage: /flow, /flow web, or /flow close", "warning");
+				ctx.ui.notify("Usage: /flow, /flow static, /flow quick, /flow web, or /flow close", "warning");
 			} else {
 				await openNative(ctx);
 			}

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,7 +13,9 @@ import { startConsole } from "./server.mjs";
 
 async function fixture(context, options = {}) {
   const stateDirectory = await mkdtemp(join(tmpdir(), "pi-console-test-"));
-  const instance = await startConsole({ port: 0, stateDirectory, ...options });
+  const { cachedAnalysis = false, ...consoleOptions } = options;
+  const project = cachedAnalysis ? await cachedCodeboardingProject(stateDirectory) : undefined;
+  const instance = await startConsole({ port: 0, stateDirectory, project, ...consoleOptions });
   context.after(async () => {
     await deadline(instance.close(), 4000, "Console shutdown did not finish");
     await rm(stateDirectory, { recursive: true, force: true });
@@ -29,6 +32,45 @@ async function fixture(context, options = {}) {
   const html = await page.text();
   const configuration = JSON.parse(html.match(/const configuration = (.+);/)[1]);
   return { instance, cookie, configuration, html };
+}
+
+async function cachedCodeboardingProject(directory) {
+  const project = join(directory, "project");
+  await mkdir(join(project, ".codeboarding"), { recursive: true });
+  const sources = [
+    {
+      path: "handler.js", name: "handleRequest", id: "handle", start: 2, end: 4, label: "Request handler",
+      content: 'import { saveOrder } from "./store.js";\nexport function handleRequest(input) {\n  return saveOrder(input);\n}\n',
+    },
+    {
+      path: "store.js", name: "saveOrder", id: "save", start: 1, end: 3, label: "Order store",
+      content: 'export function saveOrder(input) {\n  return { ...input, saved: true };\n}\n',
+    },
+  ];
+  for (const source of sources) await writeFile(join(project, source.path), source.content);
+  // A deterministic v1 schema fixture exercises the genuine cache importer and TUI without a model or runtime install.
+  const analysis = {
+    metadata: {
+      format_version: "v1", generated_at: "2026-01-01T00:00:00Z", repo_name: "terminal-fixture",
+      file_coverage_summary: { total_files: 2, analyzed: 2, not_analyzed: 0 },
+    },
+    description: "Cached analysis fixture for the native terminal integration test.",
+    files: Object.fromEntries(sources.map((source) => [source.path, {
+      content_hash: createHash("sha256").update(source.content.replace(/\n$/, "")).digest("hex").slice(0, 16),
+      methods: { [source.name]: [source.start, source.end, "function", "", source.id] },
+    }])),
+    components: sources.map((source) => ({
+      name: source.label, component_id: source.id, description: source.label,
+      key_entities: [], can_expand: false, file_methods: [source.id], components: [], components_relations: [],
+    })),
+    components_relations: [{
+      relation: "calls", src_name: "Request handler", dst_name: "Order store", src_id: "handle", dst_id: "save",
+      evidence: "The request handler passes the input to saveOrder.", is_static: true, key_edges: [["handle", "save"]],
+    }],
+    edges: [["handle", "save", [[3, 10]]]],
+  };
+  await writeFile(join(project, ".codeboarding", "analysis.json"), JSON.stringify(analysis));
+  return project;
 }
 
 function deadline(promise, timeout, message) {
@@ -173,20 +215,24 @@ test("failed Python spawn can reconnect and close without waiting for an already
   await deadline(instance.close(), 2000, "A failed spawn left shutdown waiting forever");
 });
 
-test("real Pi starts its native flow screen, executes !pwd, and survives reconnect", { timeout: 40000 }, async (context) => {
-  const { instance, cookie, configuration } = await fixture(context, { idleMs: 700 });
+test("real Pi loads cached CodeBoarding in its native flow screen, executes !pwd, and survives reconnect", { timeout: 40000 }, async (context) => {
+  const { instance, cookie, configuration } = await fixture(context, { idleMs: 700, cachedAnalysis: true });
   const first = client(instance, cookie);
   context.after(() => first.close());
   await first.open();
   first.hello(configuration.csrfToken);
-  await first.wait((value) => value.plainOutput.includes("PROJECT FLOW"), 20000, "Pi did not open its native flow screen");
-  assert.ok(first.plainOutput.includes("inside the Pi harness"));
-  assert.ok(first.plainOutput.includes("I/O relationships"));
+  await first.wait((value) => value.plainOutput.includes("PROJECT OVERVIEW"), 20000, "Pi did not load the native CodeBoarding diagram");
+  assert.ok(first.plainOutput.includes("CodeBoarding · architecture"));
+  assert.ok(first.plainOutput.includes("code relationships"));
+  assert.ok(first.plainOutput.includes("Request handler"));
+  assert.ok(first.plainOutput.includes("Order store"));
 
   let mark = first.output.length;
   first.input("\t");
-  await first.wait((value) => stripVTControlCharacters(value.output.slice(mark)).includes("SOURCE EVIDENCE"), 3000, "Tab did not open connection evidence");
-  assert.ok(first.plainOutput.includes("Source pattern; not a runtime trace."));
+  await first.wait((value) => stripVTControlCharacters(value.output.slice(mark)).includes("SOURCE REFERENCES"), 3000, "Tab did not open CodeBoarding source references");
+  assert.ok(first.plainOutput.includes("Static call sites; execution and value flow are not proven."));
+  assert.ok(first.plainOutput.includes("handler.js:3"));
+  assert.ok(first.plainOutput.includes("return saveOrder(input)"));
   mark = first.output.length;
   first.input("\u001b");
   await first.wait((value) => value.output.length > mark, 3000, "Escape did not redraw the Pi prompt");
@@ -195,7 +241,7 @@ test("real Pi starts its native flow screen, executes !pwd, and survives reconne
   first.input("!pwd; printf 'PI_CONSOLE_PROCESS_%s\\n' \"$PPID\"\r");
   await first.wait((value) => /PI_CONSOLE_PROCESS_\d+/.test(stripVTControlCharacters(value.output.slice(mark))), 10000, "Pi did not execute the !pwd shell command");
   const commandOutput = stripVTControlCharacters(first.output.slice(mark));
-  assert.ok(commandOutput.includes(instance.project), "!pwd must execute in the selected example project");
+  assert.ok(commandOutput.includes(instance.project), "!pwd must execute in the selected test project");
   const originalPid = Number(commandOutput.match(/PI_CONSOLE_PROCESS_(\d+)/)[1]);
   await first.close();
 
@@ -213,7 +259,7 @@ test("real Pi starts its native flow screen, executes !pwd, and survives reconne
 
   mark = second.output.length;
   second.input("/flow\r");
-  await second.wait((value) => stripVTControlCharacters(value.output.slice(mark)).includes("PROJECT FLOW"));
+  await second.wait((value) => stripVTControlCharacters(value.output.slice(mark)).includes("PROJECT OVERVIEW"));
   await second.close();
   await deadline(new Promise((resolve) => {
     const interval = setInterval(() => {

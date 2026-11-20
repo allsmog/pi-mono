@@ -88,7 +88,7 @@ describe("built-in project flow extension", () => {
 	test("/flow opens the native harness screen without starting a browser or HTTP server", async () => {
 		const { ctx, commands } = harness();
 		await commands.get("flow")?.handler("", ctx);
-		expect(showProjectFlow).toHaveBeenCalledWith(ctx, expect.any(AbortSignal));
+		expect(showProjectFlow).toHaveBeenCalledWith(ctx, expect.any(AbortSignal), "codeboarding");
 		expect(startFlowServer).not.toHaveBeenCalled();
 		expect(openFlowBrowser).not.toHaveBeenCalled();
 	});
@@ -111,9 +111,16 @@ describe("built-in project flow extension", () => {
 		expect(showProjectFlow).not.toHaveBeenCalled();
 		ctx.mode = "tui";
 		await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
-		expect(showProjectFlow).toHaveBeenCalledWith(ctx, expect.any(AbortSignal));
+		expect(showProjectFlow).toHaveBeenCalledWith(ctx, expect.any(AbortSignal), "codeboarding");
 		expect(startFlowServer).not.toHaveBeenCalled();
 		await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+	});
+
+	test.each(["static", "quick"] as const)("/flow %s selects that backend explicitly", async (mode) => {
+		const { ctx, commands } = harness();
+		await commands.get("flow")?.handler(mode, ctx);
+		expect(showProjectFlow).toHaveBeenCalledWith(ctx, expect.any(AbortSignal), mode);
+		expect(startFlowServer).not.toHaveBeenCalled();
 	});
 
 	test("switching the launch directory closes the old server before opening the new project", async () => {

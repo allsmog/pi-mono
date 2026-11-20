@@ -32,21 +32,27 @@ The service makes **no outbound network requests by default**. Setting `ORDER_WE
 In another terminal, from this directory:
 
 ```bash
-../../pi-test.sh --flow
+../../pi-test.sh
 ```
 
-Or, with this fork installed:
+After [installing CodeBoarding](../../packages/coding-agent/docs/project-flow.md), enter `/flow static` to analyze the example with its real source-analysis engine. Enter `/flow` for CodeBoarding's full architecture analysis, which requires its own configured model provider.
+
+To open full architecture analysis at startup, with this fork installed:
 
 ```bash
 pi --flow
 ```
 
-Or enter `/flow` inside a running Pi session. The diagram opens inside the actual harness terminal, with component and connection views, source evidence, and a rescan action. Escape returns to the coding agent. Use `pi flow` or `/flow web` if you want the optional browser companion instead.
+The diagram opens inside the actual harness terminal, with component and connection views, source evidence, and a rescan action. Escape returns to the coding agent. The selected backend is labeled in the screen.
 
-The analysis starts at this directory, so it reads the example's actual source files. It does not start the example service or execute any source.
+The analysis starts at this directory, so it reads the example's actual source files. Analysis does not start the example service.
+
+### Original I/O-pattern example
+
+Use `/flow quick` for the original lightweight scanner, or `pi flow` / `/flow web` for its optional browser companion. These do not require CodeBoarding or a model. The relationships below describe this scanner's output, rather than promising the same grouping from CodeBoarding.
 
 Follow the components: `server` accepts HTTP requests; `http` reads JSON and routes requests; `orders` validates and constructs orders; `storage` reads and writes local files; `integrations` contains the optional webhook. Console output and environment settings are also visible. Enable **Dependencies** to show which components import one another.
 
 The HTTP/API node appears because a `fetch()` call exists in `src/integrations/webhook.js`. That is a possible network relationship inferred from source, even while the webhook is disabled. It is not a claim that a request was sent. The incoming network boundary is similarly inferred from `createServer()` and `listen()`.
 
-The hosted graphical companion can use a saved analysis of this code. A hosted web terminal runs the actual Pi harness, where `/flow` scans the example directory and displays this same native screen. Neither analysis mode starts the Orders service.
+The graphical companion can also use a saved analysis of this code. Neither analysis mode starts the Orders service.

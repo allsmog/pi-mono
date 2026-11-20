@@ -3,6 +3,8 @@ export interface FlowEvidence {
 	file: string;
 	line: number;
 	text: string;
+	endLine?: number;
+	kind?: "call" | "definition" | "reference";
 }
 
 export interface FlowNode {
@@ -13,6 +15,8 @@ export interface FlowNode {
 	description: string;
 	files: string[];
 	technologies: string[];
+	parentId?: string;
+	references?: FlowEvidence[];
 }
 
 export interface FlowEdge {
@@ -20,10 +24,11 @@ export interface FlowEdge {
 	source: string;
 	target: string;
 	label: string;
-	kind: "dependency" | "read" | "write" | "network" | "execute" | "input" | "output" | "event";
+	kind: "dependency" | "read" | "write" | "network" | "execute" | "input" | "output" | "event" | "call" | "flow";
 	confidence: "detected" | "inferred";
 	evidence: FlowEvidence[];
 	count: number;
+	description?: string;
 }
 
 export interface FlowFile {
@@ -35,6 +40,13 @@ export interface FlowFile {
 
 export interface FlowGraph {
 	version: 1;
+	analysis?: {
+		engine: "codeboarding";
+		mode: "architecture" | "static";
+		generatedAt: string;
+		summary: string;
+		sourcePath?: string;
+	};
 	project: {
 		name: string;
 		root: string;

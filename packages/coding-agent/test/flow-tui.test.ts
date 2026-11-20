@@ -1,6 +1,6 @@
 import { KeybindingsManager, TUI_KEYBINDINGS, visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, test, vi } from "vitest";
-import { ProjectFlowScreen } from "../src/flow/tui.ts";
+import { ProjectFlowScreen, ProjectFlowView } from "../src/flow/tui.ts";
 import type { FlowGraph } from "../src/flow/types.ts";
 
 function graph(): FlowGraph {
@@ -99,15 +99,21 @@ describe("native project flow screen", () => {
 		[120, 40],
 		[80, 24],
 		[45, 18],
-	])("fits a %i-column, %i-row terminal and shows a real directed neighborhood", (width, rows) => {
+	])("fits a %i-column, %i-row terminal and starts at the project overview", (width, rows) => {
 		const { view } = screen({ rows });
 		const lines = view.render(width);
 		expect(lines).toHaveLength(rows);
 		expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
 		expect(lines.join("\n")).toContain("PROJECT FLOW");
-		expect(lines.join("\n")).toContain("Order service");
+		expect(lines.join("\n")).toContain("PROJECT OVERVIEW");
 		expect(lines.join("\n")).not.toContain("flowchart LR");
-		if (width >= 80) expect(lines.join("\n")).toContain("HTTP clients");
+		if (width >= 80) {
+			expect(lines.join("\n")).toContain("Order service");
+			expect(lines.join("\n")).toContain("HTTP clients");
+		} else {
+			view.handleInput("\x1b[B");
+			expect(view.render(width).join("\n")).toContain("Order service");
+		}
 	});
 
 	test("enter opens connection evidence and escape returns to the harness", () => {
@@ -124,11 +130,45 @@ describe("native project flow screen", () => {
 
 	test("the project overview is available above the focused component list", () => {
 		const { view } = screen();
+		view.handleInput("\x1b[B");
 		view.handleInput("\x1b[A");
 		const text = view.render(120).join("\n");
 		expect(text).toContain("PROJECT OVERVIEW");
 		expect(text).toContain("3 nodes · 1 visible relationships · 2 files");
 		expect(text).toContain("Project overview");
+	});
+
+	test("CodeBoarding leaf relationships are aggregated for an expandable component overview", () => {
+		const nested = graph();
+		nested.analysis = {
+			engine: "codeboarding",
+			mode: "architecture",
+			generatedAt: "2026-01-01",
+			summary: "Architecture generated from source references.",
+		};
+		nested.nodes.push(
+			{ ...nested.nodes[0], id: "handler", label: "Request handler", parentId: "app" },
+			{ ...nested.nodes[1], id: "save", label: "Save order", parentId: "store" },
+		);
+		nested.edges = [{ ...nested.edges[0], source: "handler", target: "save", kind: "flow", label: "Passes order" }];
+		const { view } = screen({ graph: nested });
+		let text = view.render(150).join("\n");
+		expect(text).toContain("CodeBoarding · architecture");
+		expect(text).toContain("3 nodes · 1 visible relationships");
+		expect(text).not.toContain("Request handler");
+		view.handleInput("\x1b[B");
+		view.handleInput("\r");
+		text = view.render(150).join("\n");
+		expect(text).toContain("Order service · OVERVIEW");
+		expect(text).toContain("Request handler");
+		view.handleInput("\r");
+		expect(view.render(150).join("\n")).toContain("PROJECT OVERVIEW");
+		view.handleInput("\t");
+		text = view.render(150).join("\n");
+		expect(text).toContain("Request handler → Save order");
+		expect(text).toContain("SOURCE REFERENCES");
+		expect(text).not.toContain("Source pattern;");
+		expect(nested.edges[0].source).toBe("handler");
 	});
 
 	test("Actions can show dependencies and refresh the actual graph", async () => {
@@ -186,5 +226,82 @@ describe("native project flow screen", () => {
 		expect(text).not.toContain("\x1b");
 		expect(text).not.toContain("\x07");
 		expect(text).toContain("readFile(path)");
+	});
+});
+
+function analysisView(analyze: ConstructorParameters<typeof ProjectFlowView>[0]["analyze"]) {
+	const done = vi.fn();
+	const requestRender = vi.fn();
+	const view = new ProjectFlowView({
+		project: "/project",
+		mode: "codeboarding",
+		theme: { fg: (_color, text) => text, bold: (text) => text },
+		keybindings: new KeybindingsManager(TUI_KEYBINDINGS),
+		getRows: () => 30,
+		requestRender,
+		done,
+		analyze,
+	});
+	return { view, done, requestRender };
+}
+
+describe("native project flow analysis lifecycle", () => {
+	test("shows progress and aborts analysis when the user leaves, ignoring late completion", async () => {
+		let finish: ((value: FlowGraph) => void) | undefined;
+		const pending = new Promise<FlowGraph>((resolve) => {
+			finish = resolve;
+		});
+		let signal: AbortSignal | undefined;
+		const { view, done, requestRender } = analysisView((options) => {
+			signal = options.signal;
+			options.onProgress("Resolving source relationships…");
+			return pending;
+		});
+		const loading = view.load();
+		const lines = view.render(80);
+		expect(lines).toHaveLength(30);
+		expect(lines.every((line) => visibleWidth(line) <= 80)).toBe(true);
+		expect(lines.join("\n")).toContain("Resolving source relationships");
+		view.handleInput("\x1b");
+		expect(signal?.aborted).toBe(true);
+		expect(done).toHaveBeenCalledOnce();
+		const renders = requestRender.mock.calls.length;
+		finish?.(graph());
+		await loading;
+		expect(requestRender).toHaveBeenCalledTimes(renders);
+	});
+
+	test.each([
+		"Install CodeBoarding to continue; /flow static uses its static engine.",
+		"Invalid CodeBoarding v1 analysis: missing edges.",
+	])("keeps an analysis error visible and retries fresh output: %s", async (message) => {
+		const analyze = vi
+			.fn<ConstructorParameters<typeof ProjectFlowView>[0]["analyze"]>()
+			.mockRejectedValueOnce(new Error(message))
+			.mockResolvedValueOnce(graph());
+		const { view } = analysisView(analyze);
+		await view.load();
+		expect(view.render(100).join("\n")).toContain(message);
+		expect(analyze).toHaveBeenCalledTimes(1);
+		expect(analyze.mock.calls[0][0].refresh).toBe(false);
+		view.handleInput("\r");
+		await vi.waitFor(() => expect(view.render(100).join("\n")).toContain("PROJECT OVERVIEW"));
+		expect(analyze).toHaveBeenCalledTimes(2);
+		expect(analyze.mock.calls[1][0].refresh).toBe(true);
+		view.close();
+	});
+
+	test("rescan requests fresh analysis and aborts the same lifecycle on close", async () => {
+		const analyze = vi.fn<ConstructorParameters<typeof ProjectFlowView>[0]["analyze"]>().mockResolvedValue(graph());
+		const { view } = analysisView(analyze);
+		await view.load();
+		view.handleInput("\t");
+		view.handleInput("\t");
+		view.handleInput("\r");
+		await vi.waitFor(() => expect(analyze).toHaveBeenCalledTimes(2));
+		expect(analyze.mock.calls[0][0].refresh).toBe(false);
+		expect(analyze.mock.calls[1][0].refresh).toBe(true);
+		view.close();
+		expect(analyze.mock.calls[1][0].signal.aborted).toBe(true);
 	});
 });

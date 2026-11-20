@@ -11,7 +11,7 @@ import {
 import { render as renderMermaid } from "lovely-mermaid";
 import type { ExtensionContext } from "../core/extensions/types.ts";
 import type { Theme } from "../modes/interactive/theme/theme.ts";
-import { analyzeProject } from "./analyzer.ts";
+import { analyzeProjectFlow } from "./project-analysis.ts";
 import type { FlowEdge, FlowGraph, FlowNode } from "./types.ts";
 
 interface FlowScreenOptions {
@@ -28,29 +28,160 @@ interface FlowScreenOptions {
 type FlowTab = "components" | "connections" | "actions";
 const TABS: FlowTab[] = ["components", "connections", "actions"];
 
-/** Display the graph inside Pi; no browser, HTTP server, or model is involved. */
-export async function showProjectFlow(ctx: ExtensionContext, signal?: AbortSignal): Promise<void> {
-	const graph = await analyzeProject(ctx.cwd);
+type AnalysisMode = "codeboarding" | "static" | "quick";
+
+interface FlowViewOptions {
+	project: string;
+	mode: AnalysisMode;
+	theme: FlowScreenOptions["theme"];
+	keybindings: KeybindingsManager;
+	getRows(): number;
+	requestRender(): void;
+	done(): void;
+	analyze(options: { signal: AbortSignal; onProgress(message: string): void; refresh: boolean }): Promise<FlowGraph>;
+	onDispose?(): void;
+}
+
+/** Run the selected analyzer and explore its graph inside the native Pi terminal. */
+export async function showProjectFlow(
+	ctx: ExtensionContext,
+	signal?: AbortSignal,
+	mode: AnalysisMode = "codeboarding",
+): Promise<void> {
 	if (signal?.aborted) return;
 	await ctx.ui.custom<void>(
 		(tui, theme, keybindings, done) => {
-			const close = () => screen.close();
-			const screen = new ProjectFlowScreen({
-				graph,
+			const close = () => view.close();
+			const view = new ProjectFlowView({
+				project: ctx.cwd,
+				mode,
 				theme,
 				keybindings,
 				getRows: () => tui.terminal.rows,
 				requestRender: () => tui.requestRender(),
 				done: () => done(undefined),
-				rescan: () => analyzeProject(ctx.cwd),
+				analyze: (options) => analyzeProjectFlow(ctx.cwd, { ...options, mode }),
 				onDispose: () => signal?.removeEventListener("abort", close),
 			});
 			signal?.addEventListener("abort", close, { once: true });
 			if (signal?.aborted) queueMicrotask(close);
-			return screen;
+			else void view.load();
+			return view;
 		},
 		{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left" } },
 	);
+}
+
+/** Own the analysis lifecycle so progress, failures and cancellation remain inside the TUI. */
+export class ProjectFlowView implements Component {
+	readonly capturesViewportInput = true;
+	private options: FlowViewOptions;
+	private controller = new AbortController();
+	private screen: ProjectFlowScreen | undefined;
+	private disposed = false;
+	private loading = false;
+	private failed = false;
+	private message = "Preparing project analysis…";
+
+	constructor(options: FlowViewOptions) {
+		this.options = options;
+	}
+
+	async load(): Promise<void> {
+		if (this.disposed || this.loading) return;
+		// A failed cached import needs regeneration instead of loading the same invalid artifact again.
+		const refresh = this.failed;
+		this.loading = true;
+		this.failed = false;
+		this.message = "Preparing project analysis…";
+		this.options.requestRender();
+		try {
+			const graph = await this.analyze(refresh);
+			if (this.disposed) return;
+			this.screen = new ProjectFlowScreen({
+				graph,
+				theme: this.options.theme,
+				keybindings: this.options.keybindings,
+				getRows: this.options.getRows,
+				requestRender: this.options.requestRender,
+				done: () => this.close(),
+				rescan: () => this.analyze(true),
+			});
+		} catch (error) {
+			if (this.disposed) return;
+			this.failed = true;
+			this.message = error instanceof Error ? error.message : String(error);
+		} finally {
+			this.loading = false;
+			if (!this.disposed) this.options.requestRender();
+		}
+	}
+
+	private analyze(refresh: boolean): Promise<FlowGraph> {
+		return this.options.analyze({
+			signal: this.controller.signal,
+			refresh,
+			onProgress: (message) => {
+				if (this.disposed) return;
+				this.message = message;
+				if (this.screen) this.screen.updateProgress(message);
+				else this.options.requestRender();
+			},
+		});
+	}
+
+	handleInput(data: string): void {
+		if (this.disposed) return;
+		if (this.screen) this.screen.handleInput(data);
+		else if (this.options.keybindings.matches(data, "tui.select.cancel")) this.close();
+		else if (this.failed && this.options.keybindings.matches(data, "tui.select.confirm")) void this.load();
+	}
+
+	render(width: number): string[] {
+		if (this.screen) return this.screen.render(width);
+		const { theme, keybindings } = this.options;
+		const w = Math.max(1, width);
+		if (w < 8) return [truncateToWidth("Pi flow", w)];
+		const rows = Math.max(12, this.options.getRows());
+		const inside = w - 2;
+		const row = (value: string) =>
+			theme.fg("borderMuted", "│") + fillLine(value, inside) + theme.fg("borderMuted", "│");
+		const body = [
+			row(` ${theme.fg("accent", theme.bold("π  PROJECT FLOW"))}`),
+			row(` ${this.options.mode === "quick" ? "Quick source scan" : "CodeBoarding analysis"}`),
+			row(` ${safe(this.options.project)}`),
+			row(""),
+			row(
+				` ${theme.fg(this.failed ? "error" : "accent", this.failed ? "Analysis could not complete" : "Analyzing project…")}`,
+			),
+			...wrapTextWithAnsi(safe(this.message), Math.max(1, inside - 2)).map((line) => row(` ${line}`)),
+		];
+		const footer = this.failed
+			? `${keybindings.getKeys("tui.select.confirm").join("/")} retry · ${keybindings.getKeys("tui.select.cancel").join("/")} return to Pi`
+			: `${keybindings.getKeys("tui.select.cancel").join("/")} cancel and return to Pi`;
+		const lines = [theme.fg("borderMuted", `╭${"─".repeat(inside)}╮`), ...body.slice(0, rows - 3)];
+		while (lines.length < rows - 2) lines.push(row(""));
+		lines.push(row(` ${theme.fg("muted", footer)}`), theme.fg("borderMuted", `╰${"─".repeat(inside)}╯`));
+		return lines;
+	}
+
+	invalidate(): void {
+		this.screen?.invalidate();
+	}
+
+	dispose(): void {
+		if (this.disposed) return;
+		this.disposed = true;
+		this.controller.abort();
+		this.screen?.dispose();
+		this.options.onDispose?.();
+	}
+
+	close(): void {
+		if (this.disposed) return;
+		this.dispose();
+		this.options.done();
+	}
 }
 
 /** Full-terminal component, using Pi's configurable selection and navigation keys. */
@@ -59,6 +190,7 @@ export class ProjectFlowScreen implements Component {
 	private options: FlowScreenOptions;
 	private graph: FlowGraph;
 	private nodes: FlowNode[];
+	private scopeId: string | undefined;
 	private tab: FlowTab = "components";
 	private selected = { components: 0, connections: 0, actions: 0 };
 	private dependencies = false;
@@ -69,6 +201,7 @@ export class ProjectFlowScreen implements Component {
 	private detailWidth = 0;
 	private bodyWidth = 60;
 	private busy = false;
+	private progress = "Analyzing project…";
 	private disposed = false;
 	private message = "Select a component to inspect its inputs and outputs.";
 	private detailCache: { key: string; lines: string[] } | undefined;
@@ -76,8 +209,7 @@ export class ProjectFlowScreen implements Component {
 	constructor(options: FlowScreenOptions) {
 		this.options = options;
 		this.graph = options.graph;
-		this.nodes = orderNodes(options.graph.nodes);
-		this.selected.components = this.nodes.length ? 1 : 0;
+		this.nodes = orderNodes(options.graph.nodes.filter((node) => !node.parentId));
 	}
 
 	handleInput(data: string): void {
@@ -137,7 +269,9 @@ export class ProjectFlowScreen implements Component {
 		const graph = this.graph;
 		const lines = [
 			theme.fg("borderMuted", `╭${"─".repeat(inside)}╮`),
-			row(` ${theme.fg("accent", theme.bold("π  PROJECT FLOW"))}  ${theme.fg("muted", "inside the Pi harness")}`),
+			row(
+				` ${theme.fg("accent", theme.bold("π  PROJECT FLOW"))}  ${theme.fg("muted", graph.analysis ? `CodeBoarding · ${graph.analysis.mode}` : "Quick source scan")}`,
+			),
 			row(
 				` ${theme.bold(safe(graph.project.name))}  ${theme.fg("muted", `${safe(graph.project.gitBranch)} · ${graph.project.fileCount} files · ${graph.nodes.length} nodes · ${graph.edges.length} relationships`)}`,
 			),
@@ -147,7 +281,9 @@ export class ProjectFlowScreen implements Component {
 					return tab === this.tab
 						? theme.fg("accent", theme.bold(`[ ${label} ]`))
 						: theme.fg("muted", `  ${label}  `);
-				}).join(" ")}  ${theme.fg("dim", this.dependencies ? "dependencies visible" : "I/O relationships")}`,
+				}).join(
+					" ",
+				)}  ${theme.fg("dim", this.dependencies ? "dependencies visible" : graph.analysis ? "code relationships" : "I/O relationships")}`,
 			),
 			rule(),
 		];
@@ -168,10 +304,10 @@ export class ProjectFlowScreen implements Component {
 				` ${theme.fg("muted", `${keys("tui.input.tab")} views · ${keys("tui.select.up")}/${keys("tui.select.down")} select · ${keys("tui.select.confirm")} inspect/action · ${keys("tui.select.cancel")} return to Pi`)}`,
 			),
 		);
-		const viewport = `PgUp/PgDn scroll · ←/→ pan · ${this.scroll + 1}–${Math.min(details.length, this.scroll + this.pageHeight)}/${details.length}`;
+		const viewport = `${keys("tui.select.pageUp")}/${keys("tui.select.pageDown")} scroll · ${keys("tui.editor.cursorLeft")}/${keys("tui.editor.cursorRight")} pan · ${this.scroll + 1}–${Math.min(details.length, this.scroll + this.pageHeight)}/${details.length}`;
 		lines.push(
 			row(
-				` ${theme.fg(this.busy ? "warning" : "dim", this.busy ? "Rescanning source…" : `Static analysis · ${viewport}`)}`,
+				` ${theme.fg(this.busy ? "warning" : "dim", this.busy ? safe(this.progress) : `${graph.analysis ? "Source references" : "Static analysis"} · ${viewport}`)}`,
 			),
 		);
 		lines.push(theme.fg("borderMuted", `╰${"─".repeat(inside)}╯`));
@@ -180,6 +316,12 @@ export class ProjectFlowScreen implements Component {
 
 	invalidate(): void {
 		this.detailCache = undefined;
+	}
+
+	updateProgress(message: string): void {
+		if (this.disposed) return;
+		this.progress = message;
+		this.options.requestRender();
 	}
 
 	dispose(): void {
@@ -201,8 +343,11 @@ export class ProjectFlowScreen implements Component {
 	private items(): string[] {
 		if (this.tab === "components") {
 			return [
-				"◈ Project overview",
-				...this.nodes.map((node) => `${node.boundary === "project" ? "●" : "◇"} ${safe(node.label)}`),
+				this.scopeId ? `↰ ${this.label(this.scopeId)}` : "◈ Project overview",
+				...this.nodes.map(
+					(node) =>
+						`${this.graph.nodes.some((child) => child.parentId === node.id) ? "▸" : node.boundary === "project" ? "●" : "◇"} ${safe(node.label)}`,
+				),
 			];
 		}
 		if (this.tab === "connections") {
@@ -227,6 +372,19 @@ export class ProjectFlowScreen implements Component {
 			} else this.close();
 		} else if (this.tab === "components") {
 			const node = this.nodes[this.selected.components - 1];
+			if (this.selected.components === 0 && this.scopeId) {
+				this.scopeId = this.graph.nodes.find((item) => item.id === this.scopeId)?.parentId;
+				this.nodes = orderNodes(this.graph.nodes.filter((item) => item.parentId === this.scopeId));
+				this.resetViewport();
+				return;
+			}
+			if (node && this.graph.nodes.some((child) => child.parentId === node.id)) {
+				this.scopeId = node.id;
+				this.nodes = orderNodes(this.graph.nodes.filter((child) => child.parentId === node.id));
+				this.selected.components = 0;
+				this.resetViewport();
+				return;
+			}
 			const edges = this.visibleEdges();
 			this.selected.connections = Math.max(
 				0,
@@ -255,8 +413,9 @@ export class ProjectFlowScreen implements Component {
 				...wrapTextWithAnsi(safe(this.graph.project.root), width),
 			);
 			lines.push("", safe(this.message), "", theme.bold("How to read this screen"));
+			if (this.graph.analysis) lines.push("", ...wrapTextWithAnsi(safe(this.graph.analysis.summary), width));
 			for (const text of [
-				"Components shows the selected component's immediate neighborhood. Enter opens its first connection.",
+				"Components shows a neighborhood. Enter expands components with children, or opens the first connection. Enter the overview inside a component to return to its parent.",
 				"Connections shows every visible relationship, its direction, and the source lines that support it.",
 				"Imports are dependencies, not confirmed data flow. Toggle them here to include dashed import edges.",
 				"Use PageUp/PageDown to scroll evidence; left/right pans wide diagrams. Escape returns to the coding agent.",
@@ -268,26 +427,55 @@ export class ProjectFlowScreen implements Component {
 			if (!edge) lines.push("No relationships in this view.", "Use Actions to show dependencies or rescan.");
 			else {
 				lines.push(theme.fg("accent", theme.bold(`${this.label(edge.source)} → ${this.label(edge.target)}`)));
-				lines.push(`${safe(edge.label)} · ${edge.kind} · ${edge.confidence} in source`, "");
+				lines.push(...wrapTextWithAnsi(`${safe(edge.label)} · ${edge.kind} · ${edge.confidence}`, width), "");
+				if (edge.description) lines.push(...wrapTextWithAnsi(safe(edge.description), width), "");
 				lines.push(
 					...this.diagram([edge], [], width),
 					"",
-					theme.bold(`SOURCE EVIDENCE · ${edge.count} occurrence(s)`),
+					theme.bold(
+						this.graph.analysis
+							? `SOURCE REFERENCES · ${edge.evidence.length} location(s)`
+							: `SOURCE EVIDENCE · ${edge.count} occurrence(s)`,
+					),
 				);
-				lines.push(theme.fg("dim", "Source pattern; not a runtime trace."));
+				lines.push(
+					...wrapTextWithAnsi(
+						theme.fg(
+							"dim",
+							this.graph.analysis
+								? edge.kind === "call"
+									? "Static call sites; execution and value flow are not proven."
+									: "Architecture relationship; source references identify its components."
+								: "Source pattern; not a runtime trace.",
+						),
+						width,
+					),
+				);
+				if (!edge.evidence.length) lines.push("No source location was verified for this relationship.");
 				for (const evidence of edge.evidence) {
-					lines.push("", theme.fg("accent", `${safe(evidence.file)}:${evidence.line}`));
+					lines.push(
+						"",
+						theme.fg(
+							"accent",
+							`${safe(evidence.file)}:${evidence.line}${evidence.endLine && evidence.endLine !== evidence.line ? `–${evidence.endLine}` : ""}${evidence.kind ? ` · ${evidence.kind}` : ""}`,
+						),
+					);
 					lines.push(...wrapTextWithAnsi(safe(evidence.text), width));
 				}
 			}
 		} else if (this.selected.components === 0) {
 			const nodes = this.nodes.slice(0, 24);
 			const ids = new Set(nodes.map((node) => node.id));
-			const visible = this.visibleEdges();
+			const visible = this.overviewEdges();
 			const edges = visible.filter((edge) => ids.has(edge.source) && ids.has(edge.target)).slice(0, 48);
-			lines.push(theme.fg("accent", theme.bold("PROJECT OVERVIEW")));
 			lines.push(
-				`${this.graph.nodes.length} nodes · ${visible.length} visible relationships · ${this.graph.project.fileCount} files`,
+				theme.fg(
+					"accent",
+					theme.bold(this.scopeId ? `${this.label(this.scopeId)} · OVERVIEW` : "PROJECT OVERVIEW"),
+				),
+			);
+			lines.push(
+				`${this.nodes.length} nodes · ${visible.length} visible relationships · ${this.graph.project.fileCount} files`,
 				"",
 			);
 			lines.push(
@@ -303,14 +491,16 @@ export class ProjectFlowScreen implements Component {
 					"",
 					theme.fg(
 						"warning",
-						`Overview shows ${nodes.length}/${this.nodes.length} nodes and ${edges.length}/${visible.length} relationships. All remain selectable in the lists.`,
+						`Overview shows ${nodes.length}/${this.nodes.length} nodes and ${edges.length}/${visible.length} relationships. Expand components and use Connections to inspect the rest.`,
 					),
 				);
 			}
 			lines.push(
 				"",
 				...wrapTextWithAnsi(
-					"This is the project graph. Select an individual component for its focused neighborhood, or Connections for source evidence. Actions controls whether import dependencies are visible.",
+					this.graph.analysis
+						? "Connections between nested components are grouped into their parents here. Enter a component to expand it; Connections shows original relationships and source references."
+						: "Select a component for its focused neighborhood, or Connections for source evidence. Actions controls whether import dependencies are visible.",
 					width,
 				),
 			);
@@ -318,11 +508,15 @@ export class ProjectFlowScreen implements Component {
 			const node = this.nodes[this.selected.components - 1];
 			if (!node) lines.push("No supported source files found.", "Use Actions to review scan limits or rescan.");
 			else {
-				const edges = this.visibleEdges().filter((edge) => edge.source === node.id || edge.target === node.id);
+				const children = this.graph.nodes.filter((child) => child.parentId === node.id);
+				const edges = (children.length ? this.overviewEdges() : this.visibleEdges()).filter(
+					(edge) => edge.source === node.id || edge.target === node.id,
+				);
 				lines.push(
 					theme.fg("accent", theme.bold(safe(node.label))),
 					`${node.boundary} boundary · ${node.kind} · ${node.files.length} source files`,
 				);
+				if (children.length) lines.push("", theme.fg("accent", `Enter expands ${children.length} components.`));
 				lines.push("", ...this.diagram(edges.slice(0, 8), [node.id], width));
 				if (edges.length > 8)
 					lines.push(
@@ -340,10 +534,41 @@ export class ProjectFlowScreen implements Component {
 					if (evidence) lines.push(theme.fg("dim", `${safe(evidence.file)}:${evidence.line}`));
 				}
 				if (node.files.length) lines.push("", theme.bold("SOURCE FILES"), ...node.files.map((file) => safe(file)));
+				for (const reference of node.references ?? []) {
+					lines.push("", theme.fg("accent", `${safe(reference.file)}:${reference.line}`));
+					lines.push(...wrapTextWithAnsi(safe(reference.text), width));
+				}
 			}
 		}
 		this.detailCache = { key, lines };
 		return lines;
+	}
+
+	private overviewEdges(): FlowEdge[] {
+		const visible = new Set(this.nodes.map((node) => node.id));
+		const nodes = new Map(this.graph.nodes.map((node) => [node.id, node]));
+		const ancestor = (id: string): string | undefined => {
+			let node = nodes.get(id);
+			while (node) {
+				if (visible.has(node.id)) return node.id;
+				node = node.parentId ? nodes.get(node.parentId) : undefined;
+			}
+			return undefined;
+		};
+		const edges = new Map<string, FlowEdge>();
+		for (const edge of this.visibleEdges()) {
+			const source = ancestor(edge.source);
+			const target = ancestor(edge.target);
+			if (!source || !target || source === target) continue;
+			const id = `${source}>${target}:${edge.kind}`;
+			const previous = edges.get(id);
+			if (previous) {
+				previous.count += edge.count;
+				if (previous.label !== edge.label) previous.label = `${edge.kind} relationships`;
+				if (edge.confidence === "inferred") previous.confidence = "inferred";
+			} else edges.set(id, { ...edge, id, source, target });
+		}
+		return [...edges.values()];
 	}
 
 	private diagram(edges: FlowEdge[], focus: string[], width: number, includedIds: string[] = focus): string[] {
@@ -355,10 +580,12 @@ export class ProjectFlowScreen implements Component {
 				.slice(0, 24);
 			return `${names.get(id)}["${label}"]${focus.includes(id) ? ":::focus" : ""}`;
 		});
-		const relationships = edges.map(
-			(edge) =>
-				`${names.get(edge.source)} ${edge.kind === "dependency" ? "-.->" : "-->"}|${edge.kind}| ${names.get(edge.target)}`,
-		);
+		const relationships = edges.map((edge) => {
+			const label = (edge.kind === "flow" ? safe(edge.label) : edge.kind)
+				.replace(/["\\[\]{}<>|;`]/g, " ")
+				.slice(0, 24);
+			return `${names.get(edge.source)} ${edge.kind === "dependency" ? "-.->" : "-->"}|${label}| ${names.get(edge.target)}`;
+		});
 		const source = [...declarations, ...relationships].join("\n");
 		let art = renderMermaid(`flowchart LR\n${source}`);
 		if (art && art.width > width) {
@@ -386,13 +613,15 @@ export class ProjectFlowScreen implements Component {
 	private async rescan(): Promise<void> {
 		if (this.busy || this.disposed) return;
 		this.busy = true;
+		this.progress = "Analyzing project…";
 		this.options.requestRender();
 		try {
 			const graph = await this.options.rescan();
 			if (this.disposed) return;
 			const previous = this.nodes[this.selected.components - 1]?.id;
 			this.graph = graph;
-			this.nodes = orderNodes(graph.nodes);
+			if (this.scopeId && !graph.nodes.some((node) => node.id === this.scopeId)) this.scopeId = undefined;
+			this.nodes = orderNodes(graph.nodes.filter((node) => node.parentId === this.scopeId));
 			this.selected.components = previous
 				? Math.max(0, this.nodes.findIndex((node) => node.id === previous) + 1)
 				: 0;
